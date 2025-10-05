@@ -1,0 +1,25 @@
+@startuml
+title Iteration 1 — Routing with WDRR
+
+actor Airflow
+participant "Routing Service" as Router
+database "Redis" as R
+participant "Models Backend" as MB
+
+== Admission ==
+Airflow -> Router: POST /schedule { estimated_tokens }
+Router -> R: LUA: refill + WDRR + guards
+R --> Router: {admit | wait}
+alt admit
+  Router --> Airflow: { model_backend_id, task_id }
+  Airflow -> MB: call(model_backend_id)
+  MB --> Airflow: result (opaque to Router)
+  Airflow -> Router: POST /complete { task_id }
+  Router -> R: in_flight--
+  Router --> Airflow: { ok: true }
+else wait
+  Router --> Airflow: { wait_for_ms }
+  Airflow -> Airflow: sleep(wait_for_ms)
+  Airflow -> Router: retry /schedule
+end
+@enduml
