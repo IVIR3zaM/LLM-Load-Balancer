@@ -1,0 +1,41 @@
+@startuml
+title Iteration 2 — Adaptive + Leased Scheduling
+
+actor Airflow
+participant "Routing Service" as Router
+database "Redis" as R
+participant "Models Backend" as MB
+actor "Controller Task" as C
+
+== Adaptive Concurrency ==
+C -> Router: GET /advice
+Router --> C: { backpressure_score, suggested_parallelism }
+C -> Airflow: resize mapped workers
+
+== Admission ==
+Airflow -> Router: POST /schedule { estimated_tokens }
+Router -> R: WDRR + TPM + Concurrency + lease
+R --> Router: {admit|wait}
+
+alt admit
+  Router --> Airflow: { model_backend_id, task_id }
+  loop until done
+    Airflow -> Router: POST /heartbeat { task_id }
+    Router -> R: renew lease
+    Router --> Airflow: { ok: true }
+  end
+  Airflow -> MB: call(model_backend_id)
+  MB --> Airflow: result
+  Airflow -> Router: POST /complete { task_id }
+  Router -> R: in_flight--, finalize
+else wait
+  Router --> Airflow: { wait_for_ms (with jitter) }
+  Airflow -> Airflow: sleep(wait_for_ms)
+  Airflow -> Router: retry /schedule
+end
+
+== Reclaim ==
+Router -> R: scan expired leases
+R --> Router: expired list
+Router -> Router: re-credit tokens/deficit; in_flight--
+@enduml

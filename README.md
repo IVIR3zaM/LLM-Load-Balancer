@@ -253,3 +253,188 @@ LUA schedule_lua(estimated_tokens):
 - **Adjustability:** Change `weight`, `max_concurrent_requests`, and `max_tokens_per_minute` per model at runtime to reflect quotas and priorities.
 - **Simplicity first:** Token bucket is intentionally approximate to keep v1 simple; WDRR evens out service share while concurrency caps protect the backend.
 - **Compatibility:** No changes to the external Models Backend API or Airflow DAG contract are required to adopt this router.
+
+
+# Iteration 2 — Adaptive Backpressure, Leases, and Faster End-to-End
+
+This iteration tightens control loops and removes failure gaps while still **calling models only via the existing Models Backend** (core requirement). It introduces: (1) **adaptive parallelism advice** to avoid over/under-subscription, (2) **lease + heartbeat** to survive Airflow restarts and 30-minute timeouts, and (3) **latency/throughput optimizations** to shave wall-clock time across the set.
+
+---
+
+## What needed improvement (from v1 and the brief)
+
+- **Fixed concurrency (20 workers)**: Can overload quotas or leave capacity idle; not responsive to changing model limits.  
+- **30-minute worker timeout & DAG restart**: In-flight work can be abandoned; router doesn’t receive completions for those tasks.  
+- **Batch tail latency**: Batch endpoint replies only after all complete → long tails slow overall completion.  
+- **Token estimation + per-minute refill**: Coarse timing can cause short bursts of `wait_for_ms` oscillations and thundering retry herds.
+
+---
+
+## Speed bottlenecks (first, the truth)
+
+1. **Batch endpoint tail**: One slow call stalls the whole batch response path.  
+2. **Static 20 workers**: Either floods a scarce model or starves a roomy one; both reduce global throughput.  
+3. **Head-of-line in WDRR when estimates are large**: Big `estimated_tokens` tasks monopolize deficits/tokens.  
+4. **Retry sleeps**: Short, uniform sleeps create synchronized retries (mini-stampedes) that don’t align with true capacity recovery.
+
+---
+
+## How we speed it up (solutions)
+
+- **Prefer single-prompt calls (when possible)** through the existing **Models Backend “single” endpoint** to eliminate batch tails; if batching is required upstream, use **micro-batches** sized by router admission rather than fixed 10s. (We still only call via the Models Backend.)  
+- **Adaptive parallelism**: Router produces a **backpressure score** and a **suggested_parallelism**; the DAG scales mapped workers toward that target instead of a fixed 20.  
+- **Size-aware WDRR**: Keep WDRR, but add an **“age bonus”** to deficits so large tasks don’t starve smaller ones indefinitely.  
+- **Smarter waits**: Return **jittered, minimal waits** aligned to the next token refill boundary or expected slot release, reducing herd effects.  
+- **Leases + heartbeats**: Make in-flight work resilient to Airflow restarts/timeouts; the router can reclaim abandoned leases and re-admit safely.
+
+---
+
+## Additions in Iteration 2
+
+### A) Adaptive Backpressure & DAG Concurrency Advice
+
+The router aggregates recent `wait_for_ms` and admit outcomes into a rolling **backpressure score** and emits a **suggested_parallelism** for the next scheduling window. Airflow reads this and adjusts the number of mapped workers accordingly (start small, ramp up, then hold steady).
+
+#### Endpoint: get scheduling advice
+
+```http
+GET /advice
+```
+
+**Response**
+
+```json
+{
+  "backpressure_score": 0.42,
+  "suggested_parallelism": 14
+}
+```
+
+- `backpressure_score` (float 0–1): 0 means no observed pressure (waits rare/small); 1 means frequent long waits (hot congestion).  
+- `suggested_parallelism` (int): Router’s recommended total concurrent **Airflow workers** for the next window, based on recent admits/waits across all models.
+
+#### Pseudocode — computing advice
+
+```pseudo
+window = last 60s rolling metrics
+let p95_wait_ms = percentile(wait_for_ms_stream, 95, window)
+let admit_rate  = admits_in_window / schedule_calls_in_window
+let inflight    = sum(in_flight[m] for m in models)
+
+backpressure_score =
+  clamp( 0.5 * normalize(p95_wait_ms, low=25ms, high=1000ms)
+       + 0.5 * (1 - admit_rate), 0, 1 )
+
+capacity_headroom =
+  sum(max_concurrent_requests[m] for m in models) - inflight
+
+suggested_parallelism =
+  clamp( inflight
+       + round( capacity_headroom * (1 - backpressure_score) )
+       , min=4, max=sum(max_concurrent_requests[m]) )
+```
+
+Airflow controller task polls `/advice` periodically and **resizes mapped tasks** next run (or dynamically if supported) to follow `suggested_parallelism`.
+
+---
+
+### B) Leases, Heartbeats, and Reclaim (survive timeouts/restarts)
+
+We add a **lease** to each admission so the router can detect abandonment if Airflow dies or the DAG restarts at 30 minutes.
+
+#### Changes to Router (new endpoint + semantics)
+
+1) **`/schedule`** (unchanged request/response) now returns an additional internal lease created server-side.  
+2) **Heartbeat**
+
+```http
+POST /heartbeat
+Content-Type: application/json
+
+{
+  "task_id": "tsk_01H..."
+}
+```
+
+3) **Reclaim (automatic)**  
+If a lease is **not** heartbeated within `lease_ttl_ms` (router-side constant), the router:
+- marks the task as **abandoned**,
+- **decrements** the in-flight counter,
+- **credits back** the appropriate tokens/deficit,
+- exposes the task for re-admission.
+
+#### Pseudocode — lease lifecycle
+
+```pseudo
+on schedule(estimated_tokens) admit:
+  lease = { task_id, model=m, expires_at=now()+lease_ttl_ms }
+  store lease; in_flight[m]++
+
+on heartbeat(task_id):
+  lease = get lease
+  if lease exists:
+    lease.expires_at = now() + lease_ttl_ms
+    return { "ok": true }
+  else:
+    return { "ok": false, "reason": "not_found" }
+
+reclaimer_loop():
+  for each expired lease:
+    m = lease.model
+    in_flight[m] = max(0, in_flight[m]-1)
+    tokens[m]    = min(cap, tokens[m] + refund_for(lease))
+    deficit[m]   = deficit[m] + refund_for(lease)
+    mark_abandoned(task_id)
+```
+
+---
+
+### C) Size-Aware WDRR and Wait Jitter
+
+```pseudo
+deficit[m] += weight[m] + age_bonus(m)
+wait_for_ms = nearest_capacity_ms * uniform(0.9, 1.1)
+```
+
+---
+
+### D) Smoothed Retry Timing (Anti-Stampede Backoff)
+
+To prevent synchronized retry bursts when all workers receive similar `wait_for_ms` values:
+
+- Each `wait_for_ms` returned by `/schedule` is **jittered** ±10 % around the calculated minimum,  
+  so retries are desynchronized and capacity recovers smoothly.
+- Router also applies a **rate-aligned wait floor**: it rounds `wait_for_ms` to the nearest
+  upcoming token-refill tick (e.g., next 100 ms boundary) instead of arbitrary small sleeps,
+  ensuring workers wake up when actual capacity exists.
+
+#### Pseudocode
+```pseudo
+base_wait_ms = min_wait_for_capacity()
+jitter = uniform(-0.1 * base_wait_ms, +0.1 * base_wait_ms)
+aligned_wait_ms = ceil_to_tick(base_wait_ms + jitter, TOKEN_REFILL_INTERVAL_MS)
+return { "wait_for_ms": max(50, aligned_wait_ms) }
+```
+
+---
+
+## Updated API (v2 additions only)
+
+```http
+GET /advice
+POST /heartbeat
+```
+
+---
+
+## PlantUML — Resilient + Adaptive Flow
+
+![Iteration 2](iteration2.svg)
+
+---
+
+## Best Practice Alignment
+
+- **Backpressure-driven concurrency** replaces static fan-out with dynamic control.
+- **Leases + heartbeats** are standard for safe re-delivery on crashes/timeouts.
+- **Existing Models Backend** remains the only model-call path, keeping architecture consistent with the assignment.
