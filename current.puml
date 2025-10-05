@@ -1,0 +1,40 @@
+@startuml
+title Current System (As-Is) - LLM Load Balancer
+
+actor "Airflow DAG" as DAG
+participant "PostgreSQL\n(tasks table)" as PG
+participant "Worker x20\n(mapped tasks)" as W
+participant "Models Backend\n(FastAPI: /single and /batch)" as MB
+participant "LLM Models (10)" as MODELS
+
+== Ingestion ==
+DAG -> PG: Fetch all new UNSOLVED tasks
+DAG -> DAG: Split tasks into 20 equal batches
+
+== Orchestration ==
+loop For each of 20 batches
+  DAG -> W: Spawn mapped worker (for its batch)
+  W -> MB: POST /batch with 10 tasks
+  note over MB
+    Under the hood:
+    - Splits into parallel model calls
+    - Single-prompt latency: ~1s-2m
+    - Responds only after all tasks complete
+  end note
+
+  MB -> MODELS: Fan-out calls to available models
+  MODELS --> MB: Model responses
+  MB --> W: Aggregated batch result
+  W -> PG: Update answers; set status=SOLVED
+  W -> W: Pull next 10 tasks from its batch
+end
+
+== Control / Retry ==
+alt Worker timeout
+  note over W: Per-worker timeout: 30 minutes
+else All workers finished
+  W --> DAG: Report completion
+end
+
+DAG -> DAG: Restart DAG
+@enduml
